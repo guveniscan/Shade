@@ -10,6 +10,8 @@ Centering needs Accessibility permission (System Settings → Privacy & Security
 
 ## Build
 
+There is no prebuilt download yet; build from source (needs the Xcode command line tools, macOS 13+):
+
 ```sh
 ./build.sh   # builds and ad-hoc signs Shade.app
 open Shade.app
@@ -17,3 +19,7 @@ open Shade.app
 
 Ad-hoc signing changes the app's identity on every build, so macOS drops the Accessibility
 permission after a rebuild; reset it with `tccutil reset Accessibility local.shade`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
