@@ -139,6 +139,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var moveTimer: Timer?
 
     @objc fileprivate func toggleEnabled() {
+        // Without Accessibility, ask first instead of dimming the screen around System Settings.
+        if !enabled && centerOnEnable && !AXIsProcessTrusted() {
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            return
+        }
         enabled.toggle()
         toggleItem.state = enabled ? .on : .off
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
@@ -158,9 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Moves the frontmost app's focused window to the center of its screen.
-    /// Needs Accessibility permission; macOS prompts for it the first time.
+    /// Needs Accessibility permission, which toggleEnabled asks for before turning on.
     private func centerFrontWindow() {
-        guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary),
+        guard AXIsProcessTrusted(),
               let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != getpid() else { return }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
