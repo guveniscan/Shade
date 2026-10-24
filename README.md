@@ -2,6 +2,8 @@
 
 A menu bar app for macOS that dims everything except the front window.
 
+![Shade dims the screen around the front window and centers it, then Esc restores it](docs/demo.gif)
+
 - **⌃⌘R** turns Shade on and slides the front window to the center of its screen.
 - **Esc** (while Shade is on) turns it off and slides the window back to where it was.
 - Intensity, "Center Window on Enable" and "Launch at Login" are in the menu bar menu.
