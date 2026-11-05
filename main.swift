@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appActivated),
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(tick),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         // Polling catches window switches inside the same app and new windows.
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.tick() }
@@ -88,17 +88,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return !list.isEmpty
     }
 
-    /// Switching apps moves the focus to the new app's front window.
-    @objc private func appActivated() {
-        tick()
-        if enabled { focusedWindow = frontWindowID() }
+    /// The app's main window via Accessibility; sheets and panels don't change it. Nil without permission.
+    private func mainWindow(of pid: pid_t) -> AXUIElement? {
+        guard AXIsProcessTrusted() else { return nil }
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXMainWindowAttribute as CFString, &ref) == .success,
+              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return (ref as! AXUIElement)
+    }
+
+    /// Remembers the front window as the one shade is focused on.
+    private func focusFrontWindow() {
+        focusedWindow = frontWindowID()
+        focusedApp = focusedWindow == nil ? nil : NSWorkspace.shared.frontmostApplication?.processIdentifier
+        focusedAXWindow = focusedApp.flatMap(mainWindow(of:))
+    }
+
+    /// The focused window was closed, its app quit, or the user picked another window or app.
+    private func focusLost() -> Bool {
+        guard let w = focusedWindow, let pid = focusedApp else { return false }
+        if !windowExists(w) { return true }
+        // Our own menu being open doesn't count.
+        if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           front != getpid(), front != pid { return true }
+        if let ax = focusedAXWindow, let main = mainWindow(of: pid), !CFEqual(ax, main) { return true }
+        return false
     }
 
     @objc private func tick() {
-        // The focused window was closed or its app quit: leave shade mode, like Esc.
-        if enabled, let w = focusedWindow, !windowExists(w) { return toggleEnabled() }
+        // Leave shade mode, like Esc, once the focus moves off the focused window.
+        if enabled, focusLost() { return toggleEnabled() }
         guard enabled, let id = frontWindowID() else { return fade(to: 0) }
-        if focusedWindow == nil { focusedWindow = id }
+        if focusedWindow == nil { focusFrontWindow() }
         for o in overlays { o.order(.below, relativeTo: Int(id)) }
         fade(to: intensity)
     }
@@ -152,8 +173,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The window we centered, where it was before, and where we put it.
     private var moved: (window: AXUIElement, from: CGPoint, to: CGPoint)?
     private var moveTimer: Timer?
-    /// The window shade is focused on. Sheets and dialogs in the same app don't replace it.
+    /// The window shade is focused on, its app, and its Accessibility element.
     private var focusedWindow: CGWindowID?
+    private var focusedApp: pid_t?
+    private var focusedAXWindow: AXUIElement?
 
     @objc fileprivate func toggleEnabled() {
         // Without Accessibility, ask first instead of dimming the screen around System Settings.
@@ -163,7 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         enabled.toggle()
         toggleItem.state = enabled ? .on : .off
-        focusedWindow = enabled ? frontWindowID() : nil
+        if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil }
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
         updateEscHotKey()
         tick()
