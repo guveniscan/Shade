@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(tick),
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appActivated),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         // Polling catches window switches inside the same app and new windows.
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.tick() }
@@ -82,8 +82,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
+    /// Whether a window still exists (on any Space, minimized or not).
+    private func windowExists(_ id: CGWindowID) -> Bool {
+        let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]] ?? []
+        return !list.isEmpty
+    }
+
+    /// Switching apps moves the focus to the new app's front window.
+    @objc private func appActivated() {
+        tick()
+        if enabled { focusedWindow = frontWindowID() }
+    }
+
     @objc private func tick() {
+        // The focused window was closed or its app quit: leave shade mode, like Esc.
+        if enabled, let w = focusedWindow, !windowExists(w) { return toggleEnabled() }
         guard enabled, let id = frontWindowID() else { return fade(to: 0) }
+        if focusedWindow == nil { focusedWindow = id }
         for o in overlays { o.order(.below, relativeTo: Int(id)) }
         fade(to: intensity)
     }
@@ -137,6 +152,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The window we centered, where it was before, and where we put it.
     private var moved: (window: AXUIElement, from: CGPoint, to: CGPoint)?
     private var moveTimer: Timer?
+    /// The window shade is focused on. Sheets and dialogs in the same app don't replace it.
+    private var focusedWindow: CGWindowID?
 
     @objc fileprivate func toggleEnabled() {
         // Without Accessibility, ask first instead of dimming the screen around System Settings.
@@ -146,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         enabled.toggle()
         toggleItem.state = enabled ? .on : .off
+        focusedWindow = enabled ? frontWindowID() : nil
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
         updateEscHotKey()
         tick()
