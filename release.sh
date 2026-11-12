@@ -10,7 +10,7 @@ PROFILE=${NOTARY_PROFILE:-shade-notary}
 [[ -z $(git status --porcelain) ]] || { echo "Commit your changes first"; exit 1; }
 
 VERSION=$VERSION ./build.sh
-codesign -dv Shade.app 2>&1 | grep -q "Authority=Developer ID Application" \
+codesign -dvv Shade.app 2>&1 | grep -q "Authority=Developer ID Application" \
   || { echo "Shade.app isn't signed with a Developer ID certificate"; exit 1; }
 
 mkdir -p dist
