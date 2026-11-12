@@ -1,6 +1,95 @@
 import Cocoa
 import ServiceManagement
 import Carbon.HIToolbox
+import CoreAudio
+import AudioToolbox
+
+/// Main volume of the default output device, via Core Audio (same approach as mic-duck).
+enum Volume {
+    private static func address(_ selector: AudioObjectPropertySelector,
+                                _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    static func outputDevice() -> AudioDeviceID? {
+        var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
+        var id = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return err == noErr && id != kAudioObjectUnknown ? id : nil
+    }
+
+    static func get(_ device: AudioDeviceID) -> Float32? {
+        var addr = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioDevicePropertyScopeOutput)
+        var vol: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        return AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &vol) == noErr ? vol : nil
+    }
+
+    static func set(_ device: AudioDeviceID, _ vol: Float32) {
+        var addr = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioDevicePropertyScopeOutput)
+        var v = vol
+        AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &v)
+    }
+}
+
+/// Which app, and which browser tab, is making sound.
+enum Playback {
+    /// Maps a helper process to the app it works for, e.g. Safari's WebKit.GPU to Safari.
+    private static let responsible = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid")
+        .map { unsafeBitCast($0, to: (@convention(c) (pid_t) -> pid_t).self) }
+
+    /// Apps currently playing audio; nil where Core Audio can't tell (before macOS 14.4).
+    static func apps() -> Set<pid_t>? {
+        guard #available(macOS 14.4, *) else { return nil }
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return nil }
+        var pids = Set<pid_t>()
+        for id in ids {
+            var running: UInt32 = 0, pid: pid_t = 0, s = UInt32(4)
+            addr.mSelector = kAudioProcessPropertyIsRunningOutput
+            guard AudioObjectGetPropertyData(id, &addr, 0, nil, &s, &running) == noErr, running != 0 else { continue }
+            addr.mSelector = kAudioProcessPropertyPID
+            guard AudioObjectGetPropertyData(id, &addr, 0, nil, &s, &pid) == noErr else { continue }
+            pids.insert(responsible?(pid) ?? pid)
+        }
+        return pids
+    }
+
+    /// Whether a window has a tab showing a speaker icon; nil if it has no tabs we can read.
+    /// Goes by structure, not labels, which are localized: Safari gives a tab a button only while it plays,
+    /// and Chromium browsers add one next to the close button.
+    static func hasAudibleTab(_ window: AXUIElement) -> Bool? {
+        var tabs: [AXUIElement] = []
+        collectTabs(window, depth: 0, into: &tabs)
+        guard !tabs.isEmpty else { return nil }
+        return tabs.contains { tab in
+            children(tab).contains {
+                attribute($0, kAXRoleAttribute) as? String == kAXButtonRole
+                    && !(attribute($0, "AXDOMClassList") as? [String] ?? []).contains("TabCloseButton")
+            }
+        }
+    }
+
+    private static func collectTabs(_ e: AXUIElement, depth: Int, into tabs: inout [AXUIElement]) {
+        guard depth < 20, attribute(e, kAXRoleAttribute) as? String != "AXWebArea" else { return }
+        if attribute(e, kAXSubroleAttribute) as? String == "AXTabButton" { return tabs.append(e) }
+        children(e).forEach { collectTabs($0, depth: depth + 1, into: &tabs) }
+    }
+
+    private static func children(_ e: AXUIElement) -> [AXUIElement] {
+        attribute(e, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    }
+
+    private static func attribute(_ e: AXUIElement, _ name: String) -> CFTypeRef? {
+        var ref: CFTypeRef?
+        return AXUIElementCopyAttributeValue(e, name as CFString, &ref) == .success ? ref : nil
+    }
+}
 
 // A borderless, click-through black window covering one screen.
 final class Overlay: NSWindow {
@@ -36,6 +125,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var centerOnEnable: Bool {
         get { defaults.object(forKey: "centerOnEnable") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "centerOnEnable") }
+    }
+
+    /// Volume while shaded, in percent; nil leaves the volume alone (the default).
+    private var duckLevel: Double? {
+        get { defaults.object(forKey: "duckLevel") as? Double }
+        set { defaults.set(newValue, forKey: "duckLevel") }
+    }
+    private let duckLevels: [(title: String, percent: Double?)] = [
+        ("Off", nil), ("Mute", 0), ("0.5%", 0.5), ("1%", 1), ("2%", 2), ("5%", 5), ("10%", 10), ("20%", 20),
+    ]
+
+    func applicationWillTerminate(_ notification: Notification) {
+        restoreVolume()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -156,6 +258,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.state = centerOnEnable ? .on : .off
         menu.addItem(center)
 
+        let volumeMenu = NSMenu()
+        for (i, l) in duckLevels.enumerated() {
+            let mi = NSMenuItem(title: l.title, action: #selector(chooseDuckLevel(_:)), keyEquivalent: "")
+            mi.tag = i
+            mi.state = l.percent == duckLevel ? .on : .off
+            volumeMenu.addItem(mi)
+            if i == 0 { volumeMenu.addItem(.separator()) }
+        }
+        volumeMenu.items.forEach { $0.target = self }
+        let volumeItem = NSMenuItem(title: "Lower Volume While Shaded", action: nil, keyEquivalent: "")
+        volumeItem.submenu = volumeMenu
+        menu.addItem(volumeItem)
+
         let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -177,6 +292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var focusedWindow: CGWindowID?
     private var focusedApp: pid_t?
     private var focusedAXWindow: AXUIElement?
+    /// Set while the volume is lowered: the output device, its original volume, and the level we set.
+    private var ducked: (device: AudioDeviceID, original: Float32, applied: Float32)?
 
     @objc fileprivate func toggleEnabled() {
         // Without Accessibility, ask first instead of dimming the screen around System Settings.
@@ -188,8 +305,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem.state = enabled ? .on : .off
         if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil }
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
+        if enabled { duckVolume() } else { restoreVolume() }
         updateEscHotKey()
         tick()
+    }
+
+    /// Whether the sound comes from the focused window, so ducking it would turn down what the user is watching.
+    /// Before macOS 14.4 it can't see who is playing and says no, so the volume is lowered as before.
+    private func focusedWindowIsPlaying() -> Bool {
+        guard let pid = focusedApp, Playback.apps()?.contains(pid) == true else { return false }
+        var ref: CFTypeRef?
+        let windows = AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXWindowsAttribute as CFString, &ref) == .success
+            ? (ref as? [AXUIElement] ?? []) : []
+        // With one window, or without tabs to look at, the app playing is the window playing.
+        guard windows.count > 1, let window = focusedAXWindow else { return true }
+        return Playback.hasAudibleTab(window) ?? true
+    }
+
+    /// Lowers the output volume to the chosen level, never raising it.
+    /// Skipped when the focused window is the one making sound.
+    private func duckVolume() {
+        guard let percent = duckLevel, !focusedWindowIsPlaying(),
+              let out = Volume.outputDevice(), let current = Volume.get(out) else { return }
+        let target = min(ducked?.original ?? current, Float32(percent / 100))
+        ducked = (out, ducked?.original ?? current, target)
+        Volume.set(out, target)
+    }
+
+    /// Puts the volume back, unless the user changed it while shaded.
+    private func restoreVolume() {
+        guard let d = ducked else { return }
+        ducked = nil
+        if let now = Volume.get(d.device), abs(now - d.applied) > 0.01 { return }
+        Volume.set(d.device, d.original)
+    }
+
+    @objc private func chooseDuckLevel(_ sender: NSMenuItem) {
+        duckLevel = duckLevels[sender.tag].percent
+        sender.menu?.items.forEach { $0.state = $0 == sender ? .on : .off }
+        guard enabled else { return }
+        // Apply right away while shaded, unless the user has set the volume by hand since.
+        if let d = ducked, let now = Volume.get(d.device), abs(now - d.applied) > 0.01 { return }
+        if duckLevel == nil { restoreVolume() } else { duckVolume() }
     }
 
     /// Esc leaves shade mode, like exiting full screen.
