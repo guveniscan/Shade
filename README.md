@@ -31,7 +31,7 @@ open Shade.app
 
 Without a Developer ID certificate the app is signed ad-hoc, which changes its identity on every build,
 so macOS drops the Accessibility permission after a rebuild; reset it with
-`tccutil reset Accessibility local.shade`.
+`tccutil reset Accessibility com.guveniscan.Shade`.
 
 `./release.sh <version>` builds, notarizes and publishes a GitHub release. It needs a one-time
 `xcrun notarytool store-credentials shade-notary`.
