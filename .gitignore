@@ -1,3 +1,4 @@
 Shade.app/
 *.bak*
 .DS_Store
+dist/

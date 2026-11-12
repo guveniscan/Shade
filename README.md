@@ -21,15 +21,20 @@ browsers (Chrome, Brave, Edge, …) and has been tried on Safari and Brave; a mu
 
 ## Build
 
-There is no prebuilt download yet; build from source (needs the Xcode command line tools, macOS 13+):
+Download the notarized app from [Releases](https://github.com/guveniscan/Shade/releases), or build from
+source (needs the Xcode command line tools, macOS 13+):
 
 ```sh
-./build.sh   # builds and ad-hoc signs Shade.app
+./build.sh   # builds Shade.app, signed with your Developer ID certificate if you have one
 open Shade.app
 ```
 
-Ad-hoc signing changes the app's identity on every build, so macOS drops the Accessibility
-permission after a rebuild; reset it with `tccutil reset Accessibility local.shade`.
+Without a Developer ID certificate the app is signed ad-hoc, which changes its identity on every build,
+so macOS drops the Accessibility permission after a rebuild; reset it with
+`tccutil reset Accessibility local.shade`.
+
+`./release.sh <version>` builds, notarizes and publishes a GitHub release. It needs a one-time
+`xcrun notarytool store-credentials shade-notary`.
 
 ## License
 
