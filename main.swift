@@ -216,20 +216,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let main = mainWindow(of: pid)
         if windowExists(w), let ax = focusedAXWindow, let main, CFEqual(ax, main) {
             focusedFrame = frame(of: ax) ?? focusedFrame
+            // Picking up a tab mid-switch can leave the old tab's ID behind; take the front window's instead,
+            // when it's the same size (not a sheet or popover).
+            if let front = frontWindowID(), front != w, let b = windowBounds(front), let f = focusedFrame,
+               abs(b.width - f.width) < 2, abs(b.height - f.height) < 2 { focusedWindow = front }
+            lostSince = nil
             return false
         }
-        if switchedTab(to: main) { focusFrontWindow(); return false }
-        return !windowExists(w) || (focusedAXWindow != nil && main != nil)
+        if let main, switchedTab(to: main) { followTab(main); lostSince = nil; return false }
+        // Without Accessibility there's no main window to compare, so only a closed window counts.
+        if windowExists(w), focusedAXWindow == nil || main == nil { lostSince = nil; return false }
+        // Mid tab switch, the old tab can still be on screen or briefly missing from the window list,
+        // so the loss has to last a moment before it counts.
+        let since = lostSince ?? Date()
+        lostSince = since
+        return Date().timeIntervalSince(since) > 0.5
+    }
+
+    private func windowBounds(_ id: CGWindowID) -> CGRect? {
+        let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]] ?? []
+        guard let b = list.first?[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
+        return CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
     }
 
     /// Native tabs (Terminal, Finder, …) are separate windows stacked in one spot, so picking or closing a tab
-    /// swaps the main window. Counts as a tab switch when the old window went away or off screen and the new
-    /// one sits exactly where it was.
-    private func switchedTab(to main: AXUIElement?) -> Bool {
-        guard let w = focusedWindow, !windowIsOnScreen(w), let main, let old = focusedFrame,
-              let new = frame(of: main) else { return false }
-        return abs(new.minX - old.minX) < 2 && abs(new.minY - old.minY) < 2
-            && abs(new.width - old.width) < 2 && abs(new.height - old.height) < 2
+    /// swaps the main window. Picking one hides the old window without minimizing it; closing one puts a
+    /// same-size window where it was. Only the tab we centered moved, so the others can sit at its old spot.
+    private func switchedTab(to main: AXUIElement) -> Bool {
+        guard let w = focusedWindow, let old = focusedFrame, let new = frame(of: main),
+              abs(new.width - old.width) < 2, abs(new.height - old.height) < 2 else { return false }
+        if windowExists(w) {
+            let minimized = focusedAXWindow.flatMap { ax -> Bool? in
+                var ref: CFTypeRef?
+                return AXUIElementCopyAttributeValue(ax, kAXMinimizedAttribute as CFString, &ref) == .success ? ref as? Bool : nil
+            } ?? false
+            return !windowIsOnScreen(w) && !minimized
+        }
+        let near = { (p: CGPoint) in abs(new.minX - p.x) < 2 && abs(new.minY - p.y) < 2 }
+        return near(old.origin) || moved.map { near($0.from) } == true
+    }
+
+    /// Makes the newly picked tab the focused window, and keeps it where the centered tab was.
+    private func followTab(_ tab: AXUIElement) {
+        if var m = moved {
+            if let pos = frame(of: tab)?.origin, abs(pos.x - m.to.x) >= 2 || abs(pos.y - m.to.y) >= 2 {
+                setPosition(tab, m.to)
+            }
+            m.tabs.removeAll { CFEqual($0, tab) }
+            m.tabs.append(m.window)
+            m.window = tab
+            moved = m
+        }
+        focusFrontWindow()
+    }
+
+    private func setPosition(_ window: AXUIElement, _ point: CGPoint) {
+        var p = point
+        if let value = AXValueCreate(.cgPoint, &p) {
+            AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+        }
     }
 
     private func windowIsOnScreen(_ id: CGWindowID) -> Bool {
@@ -250,7 +295,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func tick() {
         // Leave shade mode, like Esc, once the focus moves off the focused window.
         if enabled, focusLost() { return toggleEnabled() }
-        guard enabled, let id = frontWindowID() else { return fade(to: 0) }
+        guard enabled else { return fade(to: 0) }
+        // No front window for a moment (a tab switch hides one window before showing the next) isn't a reason
+        // to undim; real focus changes end shade mode above.
+        guard let id = frontWindowID() else { return }
         if focusedWindow == nil { focusFrontWindow() }
         for o in overlays { o.order(.below, relativeTo: Int(id)) }
         fade(to: intensity)
@@ -316,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var escHotKeyRef: EventHotKeyRef?
     /// The window we centered, where it was before, and where we put it.
-    private var moved: (window: AXUIElement, from: CGPoint, to: CGPoint)?
+    private var moved: (window: AXUIElement, from: CGPoint, to: CGPoint, tabs: [AXUIElement])?
     private var moveTimer: Timer?
     /// The window shade is focused on, its app, and its Accessibility element.
     private var focusedWindow: CGWindowID?
@@ -324,6 +372,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var focusedAXWindow: AXUIElement?
     /// Where the focused window last was, to recognize a tab of it taking its place.
     private var focusedFrame: CGRect?
+    /// When the focus first looked lost while the focused window still exists.
+    private var lostSince: Date?
     /// Set while the volume is lowered: the output device, its original volume, and the level we set.
     private var ducked: (device: AudioDeviceID, original: Float32, applied: Float32)?
 
@@ -335,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         enabled.toggle()
         toggleItem.state = enabled ? .on : .off
-        if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil; focusedFrame = nil }
+        if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil; focusedFrame = nil; lostSince = nil }
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
         if enabled { duckVolume() } else { restoreVolume() }
         updateEscHotKey()
@@ -423,7 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var target = CGPoint(x: vf.midX - size.width / 2,
                              y: primaryHeight - vf.maxY + max(0, (vf.height - size.height) / 2))
         target.x = max(vf.minX, target.x)
-        moved = (window, pos, target)
+        moved = (window, pos, target, [])
         animate(window, from: pos, to: target) { [weak self] in
             // Read back where the app actually put it; some windows get nudged.
             var ref: CFTypeRef?
@@ -460,6 +510,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func restoreWindow() {
         guard let m = moved else { return }
         moved = nil
+        // Other tabs we moved along go back too; they're hidden, so no need to slide them.
+        for tab in m.tabs where frame(of: tab).map({ abs($0.minX - m.to.x) < 2 && abs($0.minY - m.to.y) < 2 }) == true {
+            setPosition(tab, m.from)
+        }
         var ref: CFTypeRef?
         var current = CGPoint.zero
         let midSlide = moveTimer != nil
