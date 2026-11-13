@@ -204,17 +204,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         focusedWindow = frontWindowID()
         focusedApp = focusedWindow == nil ? nil : NSWorkspace.shared.frontmostApplication?.processIdentifier
         focusedAXWindow = focusedApp.flatMap(mainWindow(of:))
+        focusedFrame = focusedAXWindow.flatMap(frame(of:))
     }
 
     /// The focused window was closed, its app quit, or the user picked another window or app.
     private func focusLost() -> Bool {
         guard let w = focusedWindow, let pid = focusedApp else { return false }
-        if !windowExists(w) { return true }
         // Our own menu being open doesn't count.
         if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
            front != getpid(), front != pid { return true }
-        if let ax = focusedAXWindow, let main = mainWindow(of: pid), !CFEqual(ax, main) { return true }
-        return false
+        let main = mainWindow(of: pid)
+        if windowExists(w), let ax = focusedAXWindow, let main, CFEqual(ax, main) {
+            focusedFrame = frame(of: ax) ?? focusedFrame
+            return false
+        }
+        if switchedTab(to: main) { focusFrontWindow(); return false }
+        return !windowExists(w) || (focusedAXWindow != nil && main != nil)
+    }
+
+    /// Native tabs (Terminal, Finder, …) are separate windows stacked in one spot, so picking or closing a tab
+    /// swaps the main window. Counts as a tab switch when the old window went away or off screen and the new
+    /// one sits exactly where it was.
+    private func switchedTab(to main: AXUIElement?) -> Bool {
+        guard let w = focusedWindow, !windowIsOnScreen(w), let main, let old = focusedFrame,
+              let new = frame(of: main) else { return false }
+        return abs(new.minX - old.minX) < 2 && abs(new.minY - old.minY) < 2
+            && abs(new.width - old.width) < 2 && abs(new.height - old.height) < 2
+    }
+
+    private func windowIsOnScreen(_ id: CGWindowID) -> Bool {
+        let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]] ?? []
+        return list.first?[kCGWindowIsOnscreen as String] as? Bool ?? false
+    }
+
+    private func frame(of window: AXUIElement) -> CGRect? {
+        var posRef: CFTypeRef?, sizeRef: CFTypeRef?
+        var pos = CGPoint.zero, size = CGSize.zero
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              AXValueGetValue(posRef as! AXValue, .cgPoint, &pos),
+              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: pos, size: size)
     }
 
     @objc private func tick() {
@@ -292,6 +322,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var focusedWindow: CGWindowID?
     private var focusedApp: pid_t?
     private var focusedAXWindow: AXUIElement?
+    /// Where the focused window last was, to recognize a tab of it taking its place.
+    private var focusedFrame: CGRect?
     /// Set while the volume is lowered: the output device, its original volume, and the level we set.
     private var ducked: (device: AudioDeviceID, original: Float32, applied: Float32)?
 
@@ -303,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         enabled.toggle()
         toggleItem.state = enabled ? .on : .off
-        if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil }
+        if enabled { focusFrontWindow() } else { focusedWindow = nil; focusedApp = nil; focusedAXWindow = nil; focusedFrame = nil }
         if enabled { if centerOnEnable { centerFrontWindow() } } else { restoreWindow() }
         if enabled { duckVolume() } else { restoreVolume() }
         updateEscHotKey()
